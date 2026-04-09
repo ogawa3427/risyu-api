@@ -93,3 +93,70 @@ UIに以下を表示する：
 | `false` | `null` | 60秒以内。キャッシュそのまま |
 | `true` | `null` | 60秒経過後の最初のリクエスト。Lambdaがinvokeを送った直後でまだスクレイピング未起動 |
 | `true` | `"20xx-..."` | スクレイピング実行中 |
+
+---
+
+## バックエンドのステートマシン
+
+クライアントが受け取るレスポンスがどの状態から来ているかを理解するための参考。
+
+### 状態一覧
+
+```
+┌─────────────────┐
+│   uninitiated   │  S3にもローカルにもTSVなし（初回デプロイ直後）
+└────────┬────────┘
+         │ /refresh が来る（初回）
+         ▼
+┌─────────────────┐
+│  initializing   │  スクレイピング実行中・TSVはまだない
+└────────┬────────┘
+         │ スクレイピング成功 → S3にTSV書き込み
+         ▼
+┌─────────────────┐
+│      fresh      │  TSVあり・前回collectから60秒以内
+└────────┬────────┘
+         │ 60秒経過
+         ▼
+┌─────────────────┐
+│      stale      │  TSVあり・60秒以上経過・次のスクレイピング未着手
+└────────┬────────┘
+         │ /refresh が来る（stale検知）
+         ▼
+┌─────────────────┐
+│   refreshing    │  古いTSVを返しつつバックグラウンドでスクレイピング中
+└────────┬────────┘
+         │ スクレイピング成功 → S3のTSV更新
+         ▼
+       fresh  （失敗した場合はstaleに戻る）
+```
+
+### 各状態での `/api` レスポンス
+
+| 状態 | HTTP | `reason` | `preparingNext` | `currentCollectStartedAt` | `rows` |
+|---|---|---|---|---|---|
+| uninitiated | 202 | `"initializing"` | `true` | `null` | なし |
+| initializing | 202 | `"initializing"` | `true` | `null` | なし |
+| fresh | 200 | `"cached"` | `false` | `null` | 最新データ |
+| stale（最初の1req） | 200 | `"refreshing_in_background"` | `true` | `null` | 古いデータ |
+| refreshing | 200 | `"refreshing_in_background"` | `true` | `"20xx-..."` | 古いデータ |
+
+### 状態遷移のトリガー
+
+`/api` は**常にバックグラウンドで `/refresh` を非同期invoke**する。  
+`/refresh` 内部でレート制限とロック管理を行い、実際にスクレイピングするかどうかを判断する。
+
+```
+/api リクエスト
+  └─ 常に triggerBackgroundRefresh() を呼ぶ
+       └─ /refresh Lambda を async invoke（fire-and-forget）
+            └─ /refresh の判断ロジック:
+                 ├─ S3ロックが有効（TTL内）→ skip（多重起動防止）
+                 ├─ 前回collectから60秒未満 → skip（too_soon）
+                 └─ それ以外 → S3ロック取得 → スクレイピング → S3更新 → ロック解放
+```
+
+### ロック（`cache/scraping-lock.json`）の役割
+
+複数のLambdaコンテナが同時に `/refresh` を受けたとき、最初の1つだけがスクレイピングを実行する。  
+ロックはスクレイピング完了後に削除される。TTL（デフォルト120秒）以内であれば後続の invoke はすべてスキップする。
