@@ -1,6 +1,10 @@
 ## risyu-api
+kurisyushien.org/api
 
 金沢大学の履修登録状況ページをスクレイピングして JSON API として提供する。
+いつまで動くかはわからないがEC2時代より安くなるといいな
+
+親プロジェクト ogawa3427/risyu
 
 ### セットアップ
 
