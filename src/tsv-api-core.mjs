@@ -10,8 +10,6 @@ import {
 } from "@aws-sdk/client-s3";
 
 // ── 構造化ロガー ──────────────────────────────────────────────────────────────
-// CloudWatch Logs Insights で fields / filter / stats が使える JSON 1行形式で出力する。
-// 例: fields @timestamp, event, result, elapsedSec | filter event = "refresh_decision"
 function log(level, event, fields = {}) {
   const entry = {
     time: new Date().toISOString(),
@@ -25,7 +23,6 @@ function log(level, event, fields = {}) {
 }
 
 const info  = (event, fields) => log("INFO",  event, fields);
-const warn  = (event, fields) => log("WARN",  event, fields);
 const error = (event, fields) => log("ERROR", event, fields);
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -44,10 +41,66 @@ const staleMs = staleSec * 1000;
 
 const s3Bucket = process.env.RISYU_S3_BUCKET ?? "";
 const s3Key = process.env.RISYU_S3_KEY ?? "cache/output.tsv";
+const historyS3Key = process.env.RISYU_S3_HISTORY_KEY ?? "cache/refresh-history.json";
 const s3Client = s3Bucket ? new S3Client({}) : null;
+
+const HISTORY_MAX = 10;
+const HISTORY_RETURN = 5;
 
 let inflightCollect = null;
 let asyncInvokePending = false;
+
+// ── refresh 履歴 ─────────────────────────────────────────────────────────────
+// Lambda コンテナ間で共有するため S3 に保存する。
+// メモリキャッシュは同一コンテナ内でのみ有効。
+
+let historyCache = null; // null = 未ロード
+
+async function loadHistory() {
+  if (!s3Client) return [];
+  try {
+    const res = await s3Client.send(
+      new GetObjectCommand({ Bucket: s3Bucket, Key: historyS3Key })
+    );
+    const raw = await res.Body.transformToString("utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) return [];
+    error("history_load", { result: "error", errorMessage: err.message });
+    return [];
+  }
+}
+
+async function saveHistory(entries) {
+  if (!s3Client) return;
+  try {
+    await s3Client.send(
+      new PutObjectCommand({
+        Bucket: s3Bucket,
+        Key: historyS3Key,
+        Body: JSON.stringify(entries),
+        ContentType: "application/json"
+      })
+    );
+  } catch (err) {
+    error("history_save", { result: "error", errorMessage: err.message });
+  }
+}
+
+async function appendRefreshHistory(entry) {
+  const current = await loadHistory();
+  const updated = [entry, ...current].slice(0, HISTORY_MAX);
+  historyCache = updated;
+  await saveHistory(updated);
+}
+
+async function getHistory() {
+  if (historyCache !== null) return historyCache;
+  historyCache = await loadHistory();
+  return historyCache;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function uploadToS3(filePath) {
   if (!s3Client) return;
@@ -63,7 +116,6 @@ async function uploadToS3(filePath) {
   }
 }
 
-// S3オブジェクトのLastModifiedだけ取得（ファイルダウンロードなし）
 async function getS3LastModified() {
   if (!s3Client) return null;
   const t0 = Date.now();
@@ -133,37 +185,52 @@ async function readCurrentParsed() {
 }
 
 async function runCollectorOnce() {
+  const startedAt = new Date().toISOString();
   const t0 = Date.now();
   info("collector_start", { outputPath, collectArgs });
 
-  await new Promise((resolve, reject) => {
-    const child = spawn("node", ["src/risyu-migrated.mjs", ...collectArgs], {
-      stdio: ["ignore", "pipe", "pipe"]
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn("node", ["src/risyu-migrated.mjs", ...collectArgs], {
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      let stderr = "";
+      child.stdout.on("data", (chunk) => {
+        process.stdout.write(chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk.toString();
+        process.stderr.write(chunk);
+      });
+      child.once("error", reject);
+      child.once("close", (code) => {
+        if (code === 0) return resolve();
+        const tail = stderr.trim().split("\n").slice(-10).join("\n");
+        reject(
+          new Error(
+            `collector failed with exit code ${code ?? "unknown"}${tail ? `: ${tail}` : ""}`
+          )
+        );
+      });
     });
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      process.stdout.write(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-      process.stderr.write(chunk);
-    });
-    child.once("error", reject);
-    child.once("close", (code) => {
-      if (code === 0) return resolve();
-      const tail = stderr.trim().split("\n").slice(-10).join("\n");
-      reject(
-        new Error(
-          `collector failed with exit code ${code ?? "unknown"}${tail ? `: ${tail}` : ""}`
-        )
-      );
-    });
-  });
 
-  await fs.access(outputPath);
-  await uploadToS3(outputPath);
+    await fs.access(outputPath);
+    await uploadToS3(outputPath);
 
-  info("collector_done", { elapsedMs: Date.now() - t0, outputPath });
+    const durationMs = Date.now() - t0;
+    info("collector_done", { elapsedMs: durationMs, outputPath });
+    await appendRefreshHistory({ startedAt, finishedAt: new Date().toISOString(), durationMs, success: true });
+  } catch (err) {
+    const durationMs = Date.now() - t0;
+    await appendRefreshHistory({
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs,
+      success: false,
+      errorMessage: err.message.split("\n")[0]
+    });
+    throw err;
+  }
 }
 
 async function runCollector() {
@@ -178,10 +245,6 @@ async function runCollector() {
   await inflightCollect;
 }
 
-// /api から叩かれるバックグラウンドrefresh起動。
-// Lambda では自分自身を rawPath: "/refresh" で非同期invoke、
-// ローカルではプロセス内バックグラウンドで runCollectorOnce を起動する。
-// 実際にスクレイピングするかどうかは refreshPayload が判断する。
 function triggerBackgroundRefresh() {
   if (process.env.AWS_LAMBDA_FUNCTION_NAME) {
     if (asyncInvokePending) {
@@ -233,22 +296,15 @@ export async function hasCachedOutput() {
   }
 }
 
-/**
- * /api エンドポイント用。
- * S3/ローカルキャッシュを読んで即返す。バックグラウンドrefreshは常に起動する。
- * TSVが一切存在しない初回のみ 202 を返す。
- */
 export async function getCachedPayload() {
   const t0 = Date.now();
 
-  // /tmp のmtimeを確認
   let mtime = await fs
     .stat(outputPath)
     .then((s) => s.mtimeMs)
     .catch(() => null);
   const tmpHit = mtime !== null;
 
-  // /tmp になければ S3 から復元（ファイルも落とす）
   if (mtime === null) {
     const s3ModifiedMs = await restoreFromS3(outputPath);
     if (s3ModifiedMs !== null) {
@@ -256,17 +312,10 @@ export async function getCachedPayload() {
     }
   }
 
-  // バックグラウンドrefreshを常に起動（refreshPayload 側がレート制限を判断する）
   triggerBackgroundRefresh();
 
-  // 完全初回: TSVがどこにもない
   if (mtime === null) {
-    info("api_response", {
-      decision: "initializing",
-      tmpHit: false,
-      s3Hit: false,
-      elapsedMs: Date.now() - t0
-    });
+    info("api_response", { decision: "initializing", tmpHit: false, s3Hit: false, elapsedMs: Date.now() - t0 });
     return {
       __status: 202,
       ok: true,
@@ -278,10 +327,11 @@ export async function getCachedPayload() {
 
   const elapsedSinceCollectMs = Date.now() - mtime;
   const isStale = elapsedSinceCollectMs > staleMs;
-  // isStale=true のとき /refresh は必ずスクレイピングを実行する。
-  // asyncInvokePending は「invokeを送った」だけで scrape が走るとは限らないので使わない。
   const preparingNext = isStale || inflightCollect !== null;
-  const parsed = await readCurrentParsed();
+  const [parsed, history] = await Promise.all([
+    readCurrentParsed(),
+    getHistory()
+  ]);
 
   info("api_response", {
     decision: preparingNext ? "refreshing_in_background" : "cached",
@@ -305,24 +355,16 @@ export async function getCachedPayload() {
     ...(preparingNext && isStale
       ? { message: "バックグラウンドで新しいデータを取得中です。まもなく更新されます。" }
       : {}),
+    recentRefreshes: history.slice(0, HISTORY_RETURN),
     ...parsed
   };
 }
 
-/**
- * /refresh エンドポイント用。
- * 実際にスクレイピングするかどうかをここで判断する。
- * - 完全初回（S3にもなし）: 即スクレイピング
- * - 前回から1分未満: 何もしない
- * - 1分以上経過: スクレイピング実行
- */
 export async function refreshPayload() {
   const t0 = Date.now();
 
-  // S3のLastModifiedを正とする（Lambda間でコンテナが異なるため）
   let lastModifiedMs = await getS3LastModified();
 
-  // S3なし（ローカル環境など）: /tmp のmtimeで代用
   if (lastModifiedMs === null) {
     lastModifiedMs = await fs
       .stat(outputPath)
@@ -330,14 +372,10 @@ export async function refreshPayload() {
       .catch(() => null);
   }
 
-  // 完全初回
   if (lastModifiedMs === null) {
     info("refresh_decision", { decision: "scrape", reason: "first_time" });
     await runCollector();
-    const mtime = await fs
-      .stat(outputPath)
-      .then((s) => s.mtimeMs)
-      .catch(() => null);
+    const mtime = await fs.stat(outputPath).then((s) => s.mtimeMs).catch(() => null);
     info("refresh_done", { reason: "initialized", elapsedMs: Date.now() - t0 });
     return {
       __status: 200,
@@ -351,7 +389,6 @@ export async function refreshPayload() {
   const elapsedMs = Date.now() - lastModifiedMs;
   const elapsedSec = Math.floor(elapsedMs / 1000);
 
-  // 1分未満: スキップ
   if (elapsedMs < staleMs) {
     const nextRefreshInSec = Math.ceil((staleMs - elapsedMs) / 1000);
     info("refresh_decision", {
@@ -371,7 +408,6 @@ export async function refreshPayload() {
     };
   }
 
-  // 1分以上経過: スクレイピング実行
   info("refresh_decision", {
     decision: "scrape",
     reason: "stale",
@@ -380,10 +416,7 @@ export async function refreshPayload() {
     lastCollectAt: new Date(lastModifiedMs).toISOString()
   });
   await runCollector();
-  const mtime = await fs
-    .stat(outputPath)
-    .then((s) => s.mtimeMs)
-    .catch(() => null);
+  const mtime = await fs.stat(outputPath).then((s) => s.mtimeMs).catch(() => null);
   info("refresh_done", { reason: "refreshed", elapsedMs: Date.now() - t0 });
   return {
     __status: 200,
