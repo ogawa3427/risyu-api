@@ -1,0 +1,95 @@
+# クライアントリファレンス実装プロンプト
+
+## APIレスポンス仕様
+
+`GET /api` のレスポンスJSON：
+
+```ts
+{
+  ok: boolean
+  reason: "cached" | "refreshing_in_background" | "initializing"
+  preparingNext: boolean          // true = バックグラウンドでスクレイピング中 or 起動済み
+  currentCollectStartedAt: string | null  // 進行中スクレイピング開始時刻(ISO8601)。null = まだ起動していない
+  lastCollectAt: string           // 前回スクレイピング完了時刻(ISO8601)
+  recentRefreshes: Array<{
+    startedAt: string
+    finishedAt: string
+    durationMs: number
+    success: boolean
+  }>
+  rowCount: number
+  rows: string[][]                // TSVデータ(行×列)
+  message?: string                // preparingNext=true かつ stale の場合のみ
+}
+```
+
+`rows[0]` = メタデータ行 `[日付文字列, "valid" | "test"]`  
+`rows[1]` = ヘッダー行（列名）  
+`rows[2...]` = データ行
+
+---
+
+## クライアントの要件
+
+### 1. 初回fetch
+
+- 起動時に `/api` をfetchしてデータを表示する。
+- `reason === "initializing"` なら「初期化中」表示をして後述のポーリングに移行する。
+
+### 2. 次回更新タイミングの予測
+
+`preparingNext === true` の場合、以下のロジックで**次回データ更新予測時刻**を計算する：
+
+```
+avgDurationMs = recentRefreshes
+  .filter(r => r.success)
+  .slice(0, 5)
+  の durationMs の平均（データがなければ 15000ms をデフォルト）
+
+if (currentCollectStartedAt != null) {
+  // スクレイピングが既に起動している → 開始時刻 + 平均所要時間
+  predictedFinishAt = new Date(currentCollectStartedAt).getTime() + avgDurationMs
+} else {
+  // stale直後の最初のリクエスト（Lambdaがまだinvokeを処理していない）
+  // コールドスタート等の余裕を加算
+  predictedFinishAt = Date.now() + avgDurationMs + 3000
+}
+
+waitMs = Math.max(predictedFinishAt - Date.now(), 1000)
+```
+
+### 3. 自動更新
+
+- `waitMs` 後に `/api` を再fetch する。
+- 再fetchしたとき `lastCollectAt` が前回と変わっていたら → データを差し替えて表示を更新する。
+- 変わっていなければ（まだ終わっていない）→ 3秒後に再試行（最大10回）。
+- `preparingNext === false` になったら自動更新タイマーを停止する。
+
+### 4. 状態表示
+
+UIに以下を表示する：
+
+| 要素 | 内容 |
+|---|---|
+| データ取得日時 | `rows[0][0]` |
+| 更新中インジケーター | `preparingNext === true` の間表示 |
+| 予測残り時間 | カウントダウン（秒単位、1秒ごとに更新） |
+| 直近更新履歴 | `recentRefreshes` の所要時間一覧 |
+
+---
+
+## 実装上の注意
+
+- fetch失敗時は指数バックオフ（1s → 2s → 4s...、最大30s）でリトライする。
+- `lastCollectAt` をローカルに保持しておき、差し替え判定に使う。
+- タイマーは複数起動しないよう管理する（前のタイマーをクリアしてから新しいものをセットする）。
+
+---
+
+## `preparingNext` / `currentCollectStartedAt` の読み方
+
+| `preparingNext` | `currentCollectStartedAt` | 意味 |
+|---|---|---|
+| `false` | `null` | 60秒以内。キャッシュそのまま |
+| `true` | `null` | 60秒経過後の最初のリクエスト。Lambdaがinvokeを送った直後でまだスクレイピング未起動 |
+| `true` | `"20xx-..."` | スクレイピング実行中 |
