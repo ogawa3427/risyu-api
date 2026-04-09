@@ -42,7 +42,7 @@ const collectArgs = (process.env.RISYU_API_COLLECT_ARGS ?? "")
 const staleSec = Number.parseInt(process.env.RISYU_STALE_SEC ?? "60", 10);
 const staleMs = staleSec * 1000;
 
-const s3Bucket = process.env.RISYU_S3_BUCKET ?? "";
+const s3Bucket = process.env.RISYU_S3_BUCKET ?? "risyu";
 const s3Key = process.env.RISYU_S3_KEY ?? "cache/output.tsv";
 const s3Client = s3Bucket ? new S3Client({}) : null;
 
