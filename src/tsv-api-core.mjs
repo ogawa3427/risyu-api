@@ -110,23 +110,29 @@ async function getHistory() {
 // S3 に開始タイムスタンプを書くことで、複数コンテナが同時にスクレイピングを
 // 起動するレースコンディションを防ぐ（TTL 以内のロックがあればスキップ）。
 
-async function checkScrapingLock() {
-  if (!s3Client) return false;
+async function getScrapingLockInfo() {
+  if (!s3Client) return null;
   try {
     const res = await s3Client.send(
       new GetObjectCommand({ Bucket: s3Bucket, Key: lockS3Key })
     );
     const raw = await res.Body.transformToString("utf8");
     const { startedAt } = JSON.parse(raw);
-    const elapsed = Date.now() - new Date(startedAt).getTime();
-    const locked = elapsed < lockTtlMs;
-    info("scraping_lock_check", { locked, elapsedSinceStartMs: elapsed, lockTtlMs });
-    return locked;
+    const elapsedSinceStartMs = Date.now() - new Date(startedAt).getTime();
+    return { startedAt, elapsedSinceStartMs };
   } catch (err) {
-    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) return false;
+    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) return null;
     error("scraping_lock_check", { result: "error", errorMessage: err.message });
-    return false;
+    return null;
   }
+}
+
+async function checkScrapingLock() {
+  const lockInfo = await getScrapingLockInfo();
+  if (!lockInfo) return false;
+  const locked = lockInfo.elapsedSinceStartMs < lockTtlMs;
+  info("scraping_lock_check", { locked, elapsedSinceStartMs: lockInfo.elapsedSinceStartMs, lockTtlMs });
+  return locked;
 }
 
 async function acquireScrapingLock() {
@@ -382,9 +388,10 @@ export async function getCachedPayload() {
   const elapsedSinceCollectMs = Date.now() - mtime;
   const isStale = elapsedSinceCollectMs > staleMs;
   const preparingNext = isStale || inflightCollect !== null;
-  const [parsed, history] = await Promise.all([
+  const [parsed, history, lockInfo] = await Promise.all([
     readCurrentParsed(),
-    getHistory()
+    getHistory(),
+    preparingNext ? getScrapingLockInfo() : Promise.resolve(null)
   ]);
 
   info("api_response", {
@@ -409,6 +416,7 @@ export async function getCachedPayload() {
     ...(preparingNext && isStale
       ? { message: "バックグラウンドで新しいデータを取得中です。まもなく更新されます。" }
       : {}),
+    currentCollectStartedAt: lockInfo?.startedAt ?? null,
     recentRefreshes: history.slice(0, HISTORY_RETURN),
     ...parsed
   };
