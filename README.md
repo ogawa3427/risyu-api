@@ -5,6 +5,7 @@ kurisyushien.org/api
 いつまで動くかはわからないがEC2時代より安くなるといいな
 
 親プロジェクト ogawa3427/risyu
+[ここ](2026-04-09-client-reference-prompt.md)を見るといい感じのフロントエンドの作り方の考え方が書いてあるかも
 
 ### セットアップ
 
