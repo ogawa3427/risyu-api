@@ -110,29 +110,26 @@ async function getHistory() {
 // S3 に開始タイムスタンプを書くことで、複数コンテナが同時にスクレイピングを
 // 起動するレースコンディションを防ぐ（TTL 以内のロックがあればスキップ）。
 
-async function getScrapingLockInfo() {
-  if (!s3Client) return null;
+// ロック状態を返す。locked=true のとき currentCollectStartedAt にタイムスタンプが入る。
+async function checkScrapingLock() {
+  if (!s3Client) return { locked: false, currentCollectStartedAt: null };
   try {
     const res = await s3Client.send(
       new GetObjectCommand({ Bucket: s3Bucket, Key: lockS3Key })
     );
     const raw = await res.Body.transformToString("utf8");
     const { startedAt } = JSON.parse(raw);
-    const elapsedSinceStartMs = Date.now() - new Date(startedAt).getTime();
-    return { startedAt, elapsedSinceStartMs };
+    const elapsed = Date.now() - new Date(startedAt).getTime();
+    const locked = elapsed < lockTtlMs;
+    info("scraping_lock_check", { locked, elapsedSinceStartMs: elapsed, lockTtlMs });
+    return { locked, currentCollectStartedAt: locked ? startedAt : null };
   } catch (err) {
-    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) return null;
+    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
+      return { locked: false, currentCollectStartedAt: null };
+    }
     error("scraping_lock_check", { result: "error", errorMessage: err.message });
-    return null;
+    return { locked: false, currentCollectStartedAt: null };
   }
-}
-
-async function checkScrapingLock() {
-  const lockInfo = await getScrapingLockInfo();
-  if (!lockInfo) return false;
-  const locked = lockInfo.elapsedSinceStartMs < lockTtlMs;
-  info("scraping_lock_check", { locked, elapsedSinceStartMs: lockInfo.elapsedSinceStartMs, lockTtlMs });
-  return locked;
 }
 
 async function acquireScrapingLock() {
@@ -388,10 +385,10 @@ export async function getCachedPayload() {
   const elapsedSinceCollectMs = Date.now() - mtime;
   const isStale = elapsedSinceCollectMs > staleMs;
   const preparingNext = isStale || inflightCollect !== null;
-  const [parsed, history, lockInfo] = await Promise.all([
+  const [parsed, history, lockState] = await Promise.all([
     readCurrentParsed(),
     getHistory(),
-    preparingNext ? getScrapingLockInfo() : Promise.resolve(null)
+    preparingNext ? checkScrapingLock() : Promise.resolve({ locked: false, currentCollectStartedAt: null })
   ]);
 
   info("api_response", {
@@ -416,7 +413,7 @@ export async function getCachedPayload() {
     ...(preparingNext && isStale
       ? { message: "バックグラウンドで新しいデータを取得中です。まもなく更新されます。" }
       : {}),
-    currentCollectStartedAt: lockInfo?.startedAt ?? null,
+    currentCollectStartedAt: lockState.currentCollectStartedAt,
     recentRefreshes: history.slice(0, HISTORY_RETURN),
     ...parsed
   };
@@ -435,7 +432,7 @@ export async function refreshPayload() {
   }
 
   if (lastModifiedMs === null) {
-    if (await checkScrapingLock()) {
+    if ((await checkScrapingLock()).locked) {
       info("refresh_decision", { decision: "skip", reason: "lock_held_first_time" });
       return { __status: 200, ok: true, reason: "scraping_in_progress", preparingNext: true };
     }
@@ -480,7 +477,7 @@ export async function refreshPayload() {
   }
 
   // 1分以上経過 → ロック確認してからスクレイピング
-  if (await checkScrapingLock()) {
+  if ((await checkScrapingLock()).locked) {
     info("refresh_decision", { decision: "skip", reason: "lock_held", elapsedSec });
     return { __status: 200, ok: true, reason: "scraping_in_progress", preparingNext: true };
   }
