@@ -92,9 +92,6 @@ function browserLaunchOptions() {
   return { headless: true };
 }
 
-async function ensureDirs() {
-  await fs.mkdir(path.resolve("artifacts"), { recursive: true });
-}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -217,12 +214,8 @@ async function runPublicCollection() {
     logStep("public:goto:start");
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: pageTimeoutMs });
     logStep("public:goto:done");
-    await page.screenshot({ path: "artifacts/screenshot.png", fullPage: true });
-    logStep("public:screenshot_saved", "artifacts/screenshot.png");
 
     const { dateText, headers, rows } = await extractRegistrationTable(page);
-    await page.screenshot({ path: "artifacts/screenshot2.png", fullPage: true });
-    logStep("public:screenshot_saved", "artifacts/screenshot2.png");
     await persistOutputs(dateText, headers, rows);
     logStep("public:done");
   } finally {
@@ -263,28 +256,22 @@ async function runAcanthusCollection() {
 
     await clickMaybe(page, "a:has-text('ログイン')");
     await page.waitForTimeout(800);
-    await page.screenshot({ path: "artifacts/sso1.png", fullPage: true });
-    logStep("acanthus:sso:screenshot_saved", "artifacts/sso1.png");
 
     await page.fill("#kuid", kuId);
     await page.fill("#password", kuPw);
     logStep("acanthus:sso:fill:done");
-    await page.screenshot({ path: "artifacts/sso2.png", fullPage: true });
 
     logStep("acanthus:sso:submit:start");
     await page.click("[name='_eventId_proceed']");
     await page.waitForLoadState("domcontentloaded", { timeout: pageTimeoutMs });
     logStep("acanthus:sso:submit:done", `url=${page.url()}`);
-    await page.screenshot({ path: "artifacts/sso3.png", fullPage: true });
 
     // SSO 完了後、目的 URL に直接 goto
     logStep("acanthus:target:goto:start", `url=${target}`);
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: pageTimeoutMs });
     logStep("acanthus:target:goto:done", `url=${page.url()}`);
-    await page.screenshot({ path: "artifacts/sso4.png", fullPage: true });
 
     const { dateText, headers, rows } = await extractRegistrationTable(page);
-    await page.screenshot({ path: "artifacts/sso5.png", fullPage: true });
     await persistOutputs(dateText, headers, rows);
     logStep("acanthus:done");
   } finally {
@@ -296,7 +283,6 @@ async function runAcanthusCollection() {
 async function main() {
   await fs.mkdir(workDir, { recursive: true });
   process.chdir(workDir);
-  await ensureDirs();
 
   if (useAcanthus) {
     do {
