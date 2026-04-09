@@ -6,7 +6,8 @@ import {
   S3Client,
   GetObjectCommand,
   PutObjectCommand,
-  HeadObjectCommand
+  HeadObjectCommand,
+  DeleteObjectCommand
 } from "@aws-sdk/client-s3";
 
 // ── 構造化ロガー ──────────────────────────────────────────────────────────────
@@ -42,6 +43,9 @@ const staleMs = staleSec * 1000;
 const s3Bucket = process.env.RISYU_S3_BUCKET ?? "";
 const s3Key = process.env.RISYU_S3_KEY ?? "cache/output.tsv";
 const historyS3Key = process.env.RISYU_S3_HISTORY_KEY ?? "cache/refresh-history.json";
+const lockS3Key = process.env.RISYU_S3_LOCK_KEY ?? "cache/scraping-lock.json";
+// スクレイピングが完了するまでの最大想定時間。この時間内にロックが書かれていたらスキップ。
+const lockTtlMs = Number.parseInt(process.env.RISYU_LOCK_TTL_MS ?? "120000", 10);
 const s3Client = s3Bucket ? new S3Client({}) : null;
 
 const HISTORY_MAX = 10;
@@ -99,6 +103,56 @@ async function getHistory() {
   if (historyCache !== null) return historyCache;
   historyCache = await loadHistory();
   return historyCache;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── スクレイピング多重起動防止ロック ─────────────────────────────────────────
+// S3 に開始タイムスタンプを書くことで、複数コンテナが同時にスクレイピングを
+// 起動するレースコンディションを防ぐ（TTL 以内のロックがあればスキップ）。
+
+async function checkScrapingLock() {
+  if (!s3Client) return false;
+  try {
+    const res = await s3Client.send(
+      new GetObjectCommand({ Bucket: s3Bucket, Key: lockS3Key })
+    );
+    const raw = await res.Body.transformToString("utf8");
+    const { startedAt } = JSON.parse(raw);
+    const elapsed = Date.now() - new Date(startedAt).getTime();
+    const locked = elapsed < lockTtlMs;
+    info("scraping_lock_check", { locked, elapsedSinceStartMs: elapsed, lockTtlMs });
+    return locked;
+  } catch (err) {
+    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) return false;
+    error("scraping_lock_check", { result: "error", errorMessage: err.message });
+    return false;
+  }
+}
+
+async function acquireScrapingLock() {
+  if (!s3Client) return;
+  try {
+    await s3Client.send(
+      new PutObjectCommand({
+        Bucket: s3Bucket,
+        Key: lockS3Key,
+        Body: JSON.stringify({ startedAt: new Date().toISOString() }),
+        ContentType: "application/json"
+      })
+    );
+    info("scraping_lock_acquire", { result: "ok" });
+  } catch (err) {
+    error("scraping_lock_acquire", { result: "error", errorMessage: err.message });
+  }
+}
+
+async function releaseScrapingLock() {
+  if (!s3Client) return;
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: s3Bucket, Key: lockS3Key }));
+  } catch {
+    // release 失敗は TTL で自然消滅するので無視
+  }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -373,8 +427,17 @@ export async function refreshPayload() {
   }
 
   if (lastModifiedMs === null) {
+    if (await checkScrapingLock()) {
+      info("refresh_decision", { decision: "skip", reason: "lock_held_first_time" });
+      return { __status: 200, ok: true, reason: "scraping_in_progress", preparingNext: true };
+    }
     info("refresh_decision", { decision: "scrape", reason: "first_time" });
-    await runCollector();
+    await acquireScrapingLock();
+    try {
+      await runCollector();
+    } finally {
+      await releaseScrapingLock();
+    }
     const mtime = await fs.stat(outputPath).then((s) => s.mtimeMs).catch(() => null);
     info("refresh_done", { reason: "initialized", elapsedMs: Date.now() - t0 });
     return {
@@ -408,6 +471,12 @@ export async function refreshPayload() {
     };
   }
 
+  // 1分以上経過 → ロック確認してからスクレイピング
+  if (await checkScrapingLock()) {
+    info("refresh_decision", { decision: "skip", reason: "lock_held", elapsedSec });
+    return { __status: 200, ok: true, reason: "scraping_in_progress", preparingNext: true };
+  }
+
   info("refresh_decision", {
     decision: "scrape",
     reason: "stale",
@@ -415,7 +484,12 @@ export async function refreshPayload() {
     staleSec,
     lastCollectAt: new Date(lastModifiedMs).toISOString()
   });
-  await runCollector();
+  await acquireScrapingLock();
+  try {
+    await runCollector();
+  } finally {
+    await releaseScrapingLock();
+  }
   const mtime = await fs.stat(outputPath).then((s) => s.mtimeMs).catch(() => null);
   info("refresh_done", { reason: "refreshed", elapsedMs: Date.now() - t0 });
   return {
