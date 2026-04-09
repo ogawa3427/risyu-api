@@ -1,0 +1,26 @@
+node_modules
+.DS_Store
+playwright-report
+test-results
+artifacts
+output.tsv
+raw.html
+
+# dotenv / secret-like local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# logs and temp files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.tmp/
+tmp/
+
+*.tsv
+rcsvs/

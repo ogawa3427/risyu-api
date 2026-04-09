@@ -1,0 +1,18 @@
+{
+  "name": "risyu-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "collect:risyu": "node src/risyu-migrated.mjs",
+    "serve:tsv": "node src/tsv-server.mjs",
+    "docker:build": "docker build -t risyu-api:local .",
+    "docker:run": "docker run --rm -p 3000:3000 -e RISYU_API_ALLOW_RE=false risyu-api:local",
+    "docker:build:lambda": "docker build -f Dockerfile.lambda -t risyu-api-lambda:local ."
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "^3.1026.0",
+    "@aws-sdk/client-s3": "^3.1027.0",
+    "playwright": "^1.53.0"
+  }
+}
