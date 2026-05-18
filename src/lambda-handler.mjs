@@ -1,5 +1,13 @@
 import { getCachedPayload, refreshPayload } from "./tsv-api-core.mjs";
 
+const corsOrigin = process.env.RISYU_CORS_ORIGIN ?? "*";
+
+const CORS_HEADERS = {
+  "access-control-allow-origin": corsOrigin,
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "content-type"
+};
+
 function logJson(level, event, fields = {}) {
   const entry = {
     time: new Date().toISOString(),
@@ -19,11 +27,15 @@ export async function handler(event = {}) {
 
   logJson("INFO", "request_received", { method, path });
 
+  if (method === "OPTIONS") {
+    return { statusCode: 204, headers: CORS_HEADERS, body: "" };
+  }
+
   if (method !== "GET" && method !== "POST") {
     logJson("WARN", "request_rejected", { method, path, statusCode: 405, reason: "method_not_allowed" });
     return {
       statusCode: 405,
-      headers: { "content-type": "application/json; charset=utf-8" },
+      headers: { "content-type": "application/json; charset=utf-8", ...CORS_HEADERS },
       body: JSON.stringify({ ok: false, message: "method not allowed" })
     };
   }
@@ -32,7 +44,7 @@ export async function handler(event = {}) {
     logJson("WARN", "request_rejected", { method, path, statusCode: 404, reason: "not_found" });
     return {
       statusCode: 404,
-      headers: { "content-type": "application/json; charset=utf-8" },
+      headers: { "content-type": "application/json; charset=utf-8", ...CORS_HEADERS },
       body: JSON.stringify({ ok: false, message: "not found" })
     };
   }
@@ -53,7 +65,7 @@ export async function handler(event = {}) {
     });
     return {
       statusCode,
-      headers: { "content-type": "application/json; charset=utf-8" },
+      headers: { "content-type": "application/json; charset=utf-8", ...CORS_HEADERS },
       body: JSON.stringify(body)
     };
   } catch (err) {
@@ -61,7 +73,7 @@ export async function handler(event = {}) {
     logJson("ERROR", "request_error", { method, path, errorMessage: message, elapsedMs: Date.now() - t0 });
     return {
       statusCode: 500,
-      headers: { "content-type": "application/json; charset=utf-8" },
+      headers: { "content-type": "application/json; charset=utf-8", ...CORS_HEADERS },
       body: JSON.stringify({ ok: false, message })
     };
   }

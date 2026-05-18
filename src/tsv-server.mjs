@@ -3,16 +3,29 @@ import { getCachedPayload, getConfigSnapshot, refreshPayload } from "./tsv-api-c
 
 const port = Number.parseInt(process.env.PORT ?? "3000", 10);
 const config = getConfigSnapshot();
+const corsOrigin = process.env.RISYU_CORS_ORIGIN ?? "*";
+
+const CORS_HEADERS = {
+  "access-control-allow-origin": corsOrigin,
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "content-type"
+};
 
 const server = http.createServer(async (req, res) => {
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, CORS_HEADERS);
+    res.end();
+    return;
+  }
+
   if (req.method !== "GET" && req.method !== "POST") {
-    res.writeHead(405, { "content-type": "application/json; charset=utf-8" });
+    res.writeHead(405, { "content-type": "application/json; charset=utf-8", ...CORS_HEADERS });
     res.end(JSON.stringify({ ok: false, message: "method not allowed" }));
     return;
   }
 
   if (!req.url || (!req.url.startsWith("/api") && !req.url.startsWith("/refresh"))) {
-    res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+    res.writeHead(404, { "content-type": "application/json; charset=utf-8", ...CORS_HEADERS });
     res.end(JSON.stringify({ ok: false, message: "not found" }));
     return;
   }
@@ -22,11 +35,11 @@ const server = http.createServer(async (req, res) => {
       ? await refreshPayload()
       : await getCachedPayload();
     const { __status, ...body } = payload;
-    res.writeHead(__status ?? 200, { "content-type": "application/json; charset=utf-8" });
+    res.writeHead(__status ?? 200, { "content-type": "application/json; charset=utf-8", ...CORS_HEADERS });
     res.end(JSON.stringify(body));
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown error";
-    res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
+    res.writeHead(500, { "content-type": "application/json; charset=utf-8", ...CORS_HEADERS });
     res.end(JSON.stringify({ ok: false, message }));
   }
 });
